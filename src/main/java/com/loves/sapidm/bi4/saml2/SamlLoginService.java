@@ -5,12 +5,7 @@
  */
 package com.loves.sapidm.bi4.saml2;
 
-import java.io.ByteArrayInputStream;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.PrintWriter;
-import java.io.StringWriter;
+import java.io.*;
 import java.util.Properties;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -35,6 +30,7 @@ import org.opensaml.saml2.core.Assertion;
 import org.opensaml.saml2.core.Response;
 import org.opensaml.saml2.metadata.IDPSSODescriptor;
 import org.opensaml.saml2.metadata.provider.DOMMetadataProvider;
+import org.opensaml.saml2.metadata.provider.MetadataProviderException;
 import org.opensaml.security.MetadataCredentialResolver;
 import org.opensaml.security.MetadataCredentialResolverFactory;
 import org.opensaml.security.MetadataCriteria;
@@ -46,12 +42,14 @@ import org.opensaml.xml.io.UnmarshallingException;
 import org.opensaml.xml.parse.BasicParserPool;
 import org.opensaml.xml.parse.XMLParserException;
 import org.opensaml.xml.security.CriteriaSet;
+import org.opensaml.xml.security.SecurityException;
 import org.opensaml.xml.security.criteria.EntityIDCriteria;
 import org.opensaml.xml.security.x509.X509Credential;
 import org.opensaml.xml.signature.Signature;
 import org.opensaml.xml.signature.SignatureValidator;
 
 import org.opensaml.xml.util.Base64;
+import org.opensaml.xml.validation.ValidationException;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.xml.sax.SAXException;
@@ -71,27 +69,61 @@ public class SamlLoginService extends HttpServlet {
      * @throws ServletException if a servlet-specific error occurs
      * @throws IOException if an I/O error occurs
      */
+
+
+    private String intendedAudience;
+    private X509Credential credential;
+    private Properties configuration;
+
+    private String samlSubject;
+    private String samlIssuer;
+    private String samlStatusCode;
+    private String samlAudience;
+
+
+    //Constants
+    private final String AUDIENCE_TAG = "audience";
+    private final String METADATA_TAG = "metadata";
+    private final String ENTITYID_TAG = "entityid";
+    private final String FORWARDED_URL_TAG = "forwardurl";
+    private final String USERNAME_ATTR_TAG = "userattr";
+
+    private final String CONF_LOCATION = "/conf/saml2sp.props";
+
+
     protected void processRequest(HttpServletRequest request, HttpServletResponse response)
-            throws ServletException, IOException, SAXException, ParserConfigurationException, UnmarshallingException, TransformerException, ConfigurationException, XMLParserException {
+            throws ServletException, IOException, SAXException, ParserConfigurationException, UnmarshallingException, TransformerException, ConfigurationException, XMLParserException, ValidationException {
         response.setContentType("text/html;charset=UTF-8");
 
-        //Process SAML Response
+        //Get SAML Response from request
         String responseMessage = request.getParameter("SAMLResponse");
 
+        //Process SAML Response
+        Response samlResponse = processSamlLogin(responseMessage);
+
+        //Validate SAML Response
+        if(validateReponse(samlResponse)){
+            //forward to the configured URL with the configured
+            System.out.println(configuration.getProperty(FORWARDED_URL_TAG) + "?" + configuration.getProperty(USERNAME_ATTR_TAG) + "=" + this.samlSubject);
+            response.sendRedirect(configuration.getProperty(FORWARDED_URL_TAG) + "?" + configuration.getProperty(USERNAME_ATTR_TAG) + "=" + this.samlSubject);
+        }
+        else{
+            //return ERROR
+            throw new ValidationException("SAML Response invalid");
+        }
+
+
+    }
+
+    private Response processSamlLogin(String responseMessage) throws ConfigurationException, UnmarshallingException, XMLParserException {
         byte[] base64DecodedResponse = Base64.decode(responseMessage);
 
-        //Unmarshalling reponse
+        //Unmarshalling response
         ByteArrayInputStream is = new ByteArrayInputStream(base64DecodedResponse);
-
-        DefaultBootstrap.bootstrap();
-        
         BasicParserPool ppMgr = new BasicParserPool();
-        
         ppMgr.setNamespaceAware(true);
-	Document inCommonMDDoc = ppMgr.parse(is);
-	Element rootElement = inCommonMDDoc.getDocumentElement();
-
-        
+        Document inCommonMDDoc = ppMgr.parse(is);
+        Element rootElement = inCommonMDDoc.getDocumentElement();
 
         //Unmarshalling the element
         UnmarshallerFactory unmarshallerFactory = Configuration.getUnmarshallerFactory();
@@ -99,79 +131,30 @@ public class SamlLoginService extends HttpServlet {
         XMLObject responseXmlObj = unmarshaller.unmarshall(rootElement);
 
         Response samlResponse = (Response) responseXmlObj;
-
         Assertion assertion = samlResponse.getAssertions().get(0);
+        this.samlSubject = assertion.getSubject().getNameID().getValue();
+        this.samlIssuer = assertion.getIssuer().getValue();
+        this.samlAudience = assertion.getConditions().getAudienceRestrictions().get(0).getAudiences().get(0).getAudienceURI();
+        this.samlStatusCode = samlResponse.getStatus().getStatusCode().getValue();
 
-        String subject = assertion.getSubject().getNameID().getValue();
-
-        String issuer = assertion.getIssuer().getValue();
-
-        String audience = assertion.getConditions().getAudienceRestrictions().get(0).getAudiences().get(0).getAudienceURI();
-
-        String statusCode = samlResponse.getStatus().getStatusCode().getValue();
-
-        boolean validation = validateReponse(samlResponse,audience);
-
-        if (validation) {
-            request.setAttribute("subject", subject);
-            RequestDispatcher dispatcher = getServletContext().getRequestDispatcher("/BOE/custom.jsp");
-            dispatcher.forward(request, response);
-        } else {
-            
-        }
+        return samlResponse;
     }
 
-    private boolean validateReponse(Response response,String audience) {
-
-        try {
+    private boolean validateReponse(Response response) throws ValidationException {
             Signature sig = response.getAssertions().get(0).getSignature();
-            String catalinaHome = System.getProperty("catalina.home");
-            //String catalinaHome = "/usr/local/Cellar/tomee-plus/1.7.4/libexec";
-            
-
-            Properties properties = new Properties();
-            properties.load(new FileInputStream(catalinaHome + "/conf/saml2sp.props"));
-            InputStream metaDataInputStream = new FileInputStream(properties.getProperty("metadata"));
-            String intendedAudience = properties.getProperty("audience");
-          
-
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            DocumentBuilder builder = factory.newDocumentBuilder();
-
-            BasicParserPool pMgr = new BasicParserPool();
-            Document metaDataDocument = pMgr.parse(metaDataInputStream);
-            Element metadataRoot = metaDataDocument.getDocumentElement();
-            metaDataInputStream.close();
-
-            DOMMetadataProvider idpMetadataProvider = new DOMMetadataProvider(metadataRoot);
-            idpMetadataProvider.setRequireValidMetadata(true);
-            idpMetadataProvider.setParserPool(new BasicParserPool());
-            idpMetadataProvider.initialize();
-
-            MetadataCredentialResolverFactory credentialResolverFactory = MetadataCredentialResolverFactory.getFactory();
-
-            MetadataCredentialResolver credentialResolver = credentialResolverFactory.getInstance(idpMetadataProvider);
-
-            CriteriaSet criteriaSet = new CriteriaSet();
-            criteriaSet.add(new MetadataCriteria(IDPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS));
-            criteriaSet.add(new EntityIDCriteria(properties.getProperty("entityid")));
-
-            X509Credential credential = (X509Credential) credentialResolver.resolveSingle(criteriaSet);
 
             SignatureValidator validator = new SignatureValidator(credential);
             validator.validate(sig);
-            
-            if(intendedAudience.equalsIgnoreCase(audience)){
-                return true;
-            }
-            else{
-                return false;
+
+            if(!intendedAudience.equalsIgnoreCase(samlAudience)){
+                throw new ValidationException("Not intended for the audience sent to");
             }
 
-        } catch (Exception e) {
-            return false;
-        }
+            return true;
     }
+
+
+
 
     private void printElement(Document doc) throws TransformerException {
 
@@ -199,19 +182,23 @@ public class SamlLoginService extends HttpServlet {
         try {
             processRequest(request, response);
         } catch (SAXException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (ParserConfigurationException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (UnmarshallingException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);;
         } catch (TransformerException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (ConfigurationException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (XMLParserException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
+        } catch (ValidationException ex) {
+            throwException(ex);
         }
     }
+
+
 
     /**
      * Handles the HTTP <code>POST</code> method.
@@ -227,17 +214,19 @@ public class SamlLoginService extends HttpServlet {
         try {
             processRequest(request, response);
         } catch (SAXException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (ParserConfigurationException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (UnmarshallingException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (TransformerException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (ConfigurationException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
         } catch (XMLParserException ex) {
-            Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+            throwException(ex);
+        } catch (ValidationException ex) {
+            throwException(ex);
         }
     }
 
@@ -251,4 +240,73 @@ public class SamlLoginService extends HttpServlet {
         return "Short description";
     }// </editor-fold>
 
+    @Override
+    public void init() throws ServletException {
+        super.init();
+
+
+
+        try {
+            this.loadConfiguration();
+        } catch (IOException e) {
+            throw new ServletException(e);
+        }
+        try {
+            this.loadIdPMetaData();
+        } catch (IOException e) {
+            throw new ServletException(e);
+        } catch (MetadataProviderException e) {
+            throw new ServletException(e);
+        } catch (SecurityException e) {
+            throw new ServletException(e);
+        } catch (XMLParserException e) {
+            throw new ServletException(e);
+        } catch (ParserConfigurationException e) {
+            throw new ServletException(e);
+        } catch (ConfigurationException e) {
+            throw new ServletException(e);
+        }
+
+    }
+
+    private void throwException(Exception ex) throws ServletException {
+        Logger.getLogger(SamlLoginService.class.getName()).log(Level.SEVERE, null, ex);
+        throw new ServletException(ex);
+    }
+
+    private void loadIdPMetaData() throws IOException, MetadataProviderException, SecurityException, XMLParserException, ParserConfigurationException, ConfigurationException {
+
+        DefaultBootstrap.bootstrap();
+        InputStream metaDataInputStream = new FileInputStream(configuration.getProperty(METADATA_TAG));
+
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        DocumentBuilder builder = factory.newDocumentBuilder();
+
+        BasicParserPool pMgr = new BasicParserPool();
+        Document metaDataDocument = pMgr.parse(metaDataInputStream);
+        Element metadataRoot = metaDataDocument.getDocumentElement();
+        metaDataInputStream.close();
+
+        DOMMetadataProvider idpMetadataProvider = new DOMMetadataProvider(metadataRoot);
+        idpMetadataProvider.setRequireValidMetadata(true);
+        idpMetadataProvider.setParserPool(new BasicParserPool());
+        idpMetadataProvider.initialize();
+
+        MetadataCredentialResolverFactory credentialResolverFactory = MetadataCredentialResolverFactory.getFactory();
+
+        MetadataCredentialResolver credentialResolver = credentialResolverFactory.getInstance(idpMetadataProvider);
+
+        CriteriaSet criteriaSet = new CriteriaSet();
+        criteriaSet.add(new MetadataCriteria(IDPSSODescriptor.DEFAULT_ELEMENT_NAME, SAMLConstants.SAML20P_NS));
+        criteriaSet.add(new EntityIDCriteria(configuration.getProperty(ENTITYID_TAG)));
+
+        this.credential = (X509Credential) credentialResolver.resolveSingle(criteriaSet);
+    }
+
+    private void loadConfiguration() throws IOException {
+        String catalinaHome = System.getProperty("catalina.home");
+        this.configuration = new Properties();
+        configuration.load(new FileInputStream(catalinaHome + CONF_LOCATION));
+        this.intendedAudience = configuration.getProperty(AUDIENCE_TAG);
+    }
 }
